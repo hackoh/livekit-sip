@@ -148,6 +148,12 @@ func NewService(region string, conf *config.Config, mon *stats.Monitor, log logg
 		s.conf.SIPRingingInterval = 1 * time.Second
 		log.Infow("ringing interval", "seconds", s.conf.SIPRingingInterval)
 	}
+	if em := s.conf.InboundEarlyMedia; em != nil {
+		if _, ok := ringbackTones[em.Tone]; !ok {
+			return nil, fmt.Errorf("unknown inbound early media tone: %q", em.Tone)
+		}
+		log.Infow("inbound early media enabled", "tone", em.Tone, "volume", ringbackVolume(em.Volume))
+	}
 	return s, nil
 }
 

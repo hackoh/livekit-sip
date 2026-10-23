@@ -83,6 +83,11 @@ type TLSConfig struct {
 	ALPNProtocols []string `yaml:"alpn"`
 }
 
+type EarlyMediaConfig struct {
+	Tone   string `yaml:"tone"`   // ringback tone name, e.g. "jp" or "etsi"
+	Volume int    `yaml:"volume"` // tone amplitude, 1..32767 (default 16383)
+}
+
 type TCPConfig struct {
 	DialPort rtcconfig.PortRange `yaml:"dial_port"`
 }
@@ -143,6 +148,10 @@ type Config struct {
 	DisableRejectedInviteCache bool `yaml:"disable_rejected_invite_cache"`
 	// AddRecordRoute forces SIP to add Record-Route headers to the responses.
 	AddRecordRoute bool `yaml:"add_record_route"`
+
+	// InboundEarlyMedia, if set, makes inbound calls send 183 Session Progress with the SDP answer
+	// instead of 180 Ringing, and play a ringback tone to the caller until the call is accepted.
+	InboundEarlyMedia *EarlyMediaConfig `yaml:"inbound_early_media"`
 
 	// AudioDTMF forces SIP to generate audio DTMF tones in addition to digital.
 	AudioDTMF              bool    `yaml:"audio_dtmf"`

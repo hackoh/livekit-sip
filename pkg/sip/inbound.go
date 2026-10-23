@@ -1089,6 +1089,13 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 		c.mon.SDPSize(len(sdpBody), false, false)
 	}
 
+	// With inbound early media, send 183 with our SDP answer and play ringback until the call is accepted.
+	stopEarlyMedia := func() {}
+	defer func() { stopEarlyMedia() }()
+	if !pinPrompt && !expectingLateAnswer {
+		stopEarlyMedia = c.startEarlyMedia(ctx, sdpBody)
+	}
+
 	ok := false
 	if pinPrompt {
 		if ok, ackTimeout, err = c.acceptCallAndWaitForMedia(ctx, disp, sdpBody, mconf.MediaTimeout, expectingLateAnswer); !ok {
@@ -1155,6 +1162,7 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 		if ok, err := c.waitSubscribe(ctx, disp.RingingTimeout, timeoutStatus); !ok {
 			return err // already sent a response. Could be success if caller hung up
 		}
+		stopEarlyMedia() // stop ringback before 200 OK and before the room audio is attached
 		if ok, ackTimeout, err = c.acceptCallAndWaitForMedia(ctx, disp, sdpBody, mconf.MediaTimeout, expectingLateAnswer); !ok {
 			return err // already sent a response. Could be success if caller hung up
 		}
@@ -2153,6 +2161,7 @@ type sipInbound struct {
 	nextRequestCSeq uint32
 	referCseq       uint32
 	ringing         chan struct{}
+	progressSDP     []byte // set once 183 Session Progress was sent; guarded by mu
 	acked           core.Fuse
 	ack             atomic.Pointer[sip.Request] // non-nil once acked is broken
 	okSentAt        time.Time                   // first 200 OK for the INVITE; guarded by mu
@@ -2312,6 +2321,51 @@ func (c *sipInbound) sendRinging() bool {
 	return c.respond(sip.StatusRinging, "Ringing")
 }
 
+func (c *sipInbound) earlyMediaEnabled() bool {
+	return c.s != nil && c.s.conf != nil && c.s.conf.InboundEarlyMedia != nil
+}
+
+// sendProvisional repeats the current provisional response: 183 with SDP once early media started,
+// otherwise 180 Ringing (unless early media is enabled and 183 is not sent yet).
+func (c *sipInbound) sendProvisional() bool {
+	if c.progressSDP != nil {
+		return c.sendProgress()
+	}
+	if c.earlyMediaEnabled() {
+		return false
+	}
+	return c.sendRinging()
+}
+
+func (c *sipInbound) sendProgress() bool {
+	if c.inviteTx == nil {
+		return false
+	}
+	r := newResponse(c.invite, statusSessionProgress, "", c.progressSDP)
+	r.AppendHeader(&contentTypeHeaderSDP)
+	r.AppendHeader(sip.HeaderClone(allowHeader))
+	// A provisional response with a To tag creates an early dialog, so it must carry Contact.
+	r.AppendHeader(c.contact)
+	c.addExtraHeaders(r)
+	if err := c.inviteTx.Respond(r); err != nil {
+		return false
+	}
+	c.setLastStatus(statusSessionProgress, sipStatus(statusSessionProgress))
+	return true
+}
+
+// SendProgress sends 183 Session Progress with the given SDP and keeps repeating it (instead of 180)
+// until the call is answered or cancelled. Reports whether it was sent.
+func (c *sipInbound) SendProgress(sdp []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.inviteTx == nil {
+		return false
+	}
+	c.progressSDP = sdp
+	return c.sendProgress()
+}
+
 func (c *sipInbound) attachTag() {
 	// Set the SIP tag for following requests from us to remote (e.g. BYE).
 	c.to.Params.Add("tag", string(c.id))
@@ -2319,11 +2373,12 @@ func (c *sipInbound) attachTag() {
 
 // StartRinging sends 180 Ringing, repeats it until the call is answered or
 // cancelled, and reports whether the first 180 was sent.
+// With inbound early media enabled, it sends nothing until SendProgress is called.
 func (c *sipInbound) StartRinging() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.attachTag()
-	sent := c.sendRinging()
+	sent := c.sendProvisional()
 	stop := make(chan struct{})
 	c.ringing = stop
 	tx := c.inviteTx
@@ -2342,7 +2397,7 @@ func (c *sipInbound) StartRinging() bool {
 			case <-ticker.C:
 			}
 			c.mu.Lock()
-			c.sendRinging()
+			c.sendProvisional()
 			c.mu.Unlock()
 		}
 	}()
