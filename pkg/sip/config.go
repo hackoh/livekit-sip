@@ -30,7 +30,7 @@ func GetServiceConfig(conf *config.Config) (*ServiceConfig, error) {
 	s := new(ServiceConfig)
 	var err error
 	if conf.UseExternalIP {
-		if s.SignalingIP, err = getPublicIP(); err != nil {
+		if s.SignalingIP, err = getPublicIP(conf.ValidateExternalIPsAsV4); err != nil {
 			return nil, err
 		}
 		if s.SignalingIPLocal, err = getLocalIP(conf.LocalNet); err != nil {
@@ -50,7 +50,7 @@ func GetServiceConfig(conf *config.Config) (*ServiceConfig, error) {
 		s.SignalingIPLocal = s.SignalingIP
 	}
 	if conf.MediaUseExternalIP && !conf.UseExternalIP {
-		if s.MediaIP, err = getPublicIP(); err != nil {
+		if s.MediaIP, err = getPublicIP(conf.ValidateExternalIPsAsV4); err != nil {
 			return nil, err
 		}
 	} else if conf.MediaNAT1To1IP != "" && conf.MediaNAT1To1IP != conf.NAT1To1IP {
@@ -65,13 +65,20 @@ func GetServiceConfig(conf *config.Config) (*ServiceConfig, error) {
 	return s, nil
 }
 
-func getPublicIP() (netip.Addr, error) {
+func getPublicIP(validateIPv4 bool) (netip.Addr, error) {
 	var err error
 	for i := 0; i < 3; i++ {
 		var ip string
 		ip, err = rtcconfig.GetExternalIPv4(context.Background(), rtcconfig.DefaultStunServers, nil)
 		if err == nil {
-			return netip.ParseAddr(ip)
+			addr, err := netip.ParseAddr(ip)
+			if err != nil {
+				return netip.Addr{}, err
+			}
+			if validateIPv4 && !addr.Is4() {
+				return netip.Addr{}, fmt.Errorf("external IP is not IPv4")
+			}
+			return addr, nil
 		} else {
 			logger.Warnw("external IP lookup failed", err, "attempt", i+1, "stunServers", rtcconfig.DefaultStunServers)
 			time.Sleep(500 * time.Millisecond)
