@@ -2183,6 +2183,7 @@ type sipInbound struct {
 	acked           core.Fuse
 	ack             atomic.Pointer[sip.Request] // non-nil once acked is broken
 	okSentAt        time.Time                   // first 200 OK for the INVITE; guarded by mu
+	okSent          atomic.Bool                 // a 200 OK was sent; readable while Accept holds mu
 	call            *inboundCall
 	lastCallStatus  atomic.Pointer[livekit.SIPStatus]
 	// state receives signaling events for the messages this INVITE's
@@ -2494,6 +2495,7 @@ retries:
 		}
 		if try == 1 {
 			c.okSentAt = time.Now()
+			c.okSent.Store(true)
 		}
 		c.setLastStatus(r.StatusCode, r.Reason)
 		if !waitForAck && c.legTr != TransportUDP {
@@ -2536,7 +2538,9 @@ func (c *sipInbound) AcceptAck(req *sip.Request, tx sip.ServerTransaction) {
 	// Only store the first ACK seen.
 	first := c.ack.CompareAndSwap(nil, req)
 	c.acked.Break()
-	if first {
+	// Only the ACK for a 200 OK is an answered call's ACK; the caller also
+	// ACKs a final error response, such as the 487 after a CANCEL.
+	if first && c.okSent.Load() {
 		c.emit(SignalingEvent{Type: EventAckReceived, Time: receivedAt, SIPMethod: string(sip.ACK), CSeq: cseq.SeqNo})
 	}
 }
