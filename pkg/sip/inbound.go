@@ -2652,6 +2652,7 @@ func (c *sipInbound) sendBye(ctx context.Context, headers map[string]string) {
 		ev.CSeq = cseq.SeqNo
 	}
 	res, err := sendBye(ctx, c.log, c, r)
+	ev.Duration = time.Since(sentAt)
 	if !byeSucceeded(res, err) && fallback != "" {
 		c.log.Infow("retrying BYE via Contact", "addr", fallback)
 		r.SetDestination(fallback)
@@ -2671,12 +2672,12 @@ func (c *sipInbound) sendBye(ctx context.Context, headers map[string]string) {
 			// The retry finished, so it is the BYE's outcome.
 			res, err = retryRes, retryErr
 			ev.CSeq = r.CSeq().SeqNo
+			ev.Duration = time.Since(sentAt)
 		case <-time.After(byeRetryGrace):
 			// The retry is still pending: report the first attempt.
 		}
 	}
 	ev.Result = byeOutcome(res, err)
-	ev.Duration = time.Since(sentAt)
 	if res != nil {
 		ev.StatusCode = int(res.StatusCode)
 	}
