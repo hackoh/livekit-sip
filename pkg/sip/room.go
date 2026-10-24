@@ -250,7 +250,8 @@ type Room struct {
 	stopped    core.Fuse
 	closed     core.Fuse
 	stats      *RoomStats
-	listenMu   sync.Mutex // serializes applyListen
+	listenMu   sync.Mutex   // serializes applyListen
+	listen     atomic.Value // string, the AttrSIPListen value in effect
 }
 
 type ParticipantConfig struct {
@@ -366,12 +367,13 @@ func (r *Room) participantLeft(rp *lksdk.RemoteParticipant) {
 
 // listenAllowed reports whether this SIP participant may hear rp, according to
 // its own AttrSIPListen attribute. A missing or empty attribute allows everyone.
+//
+// The value is kept in r.listen rather than read from the SDK, because a full
+// reconnect rejoins with the attributes of the first join and would otherwise
+// apply a stale listen list until onReconnected restores the attributes.
 func (r *Room) listenAllowed(rp *lksdk.RemoteParticipant) bool {
-	room := r.room.Load()
-	if room == nil {
-		return true
-	}
-	return listenAllows(room.LocalParticipant.Attributes()[AttrSIPListen], rp.Identity())
+	listen, _ := r.listen.Load().(string)
+	return listenAllows(listen, rp.Identity())
 }
 
 func listenAllows(listen, identity string) bool {
@@ -443,6 +445,7 @@ func (r *Room) Connect(ctx context.Context, conf *config.Config, rconf RoomConfi
 		Identity: partConf.Identity,
 		Name:     partConf.Name,
 	})
+	r.listen.Store(partConf.Attributes[AttrSIPListen])
 	roomCallback := r.newRoomCallback(conf, rconf)
 
 	if rconf.Token == "" {
@@ -537,10 +540,18 @@ func (r *Room) newRoomCallback(conf *config.Config, rconf RoomConfig) *lksdk.Roo
 				if _, ok := p.(*lksdk.LocalParticipant); !ok {
 					return
 				}
-				if _, ok := changed[AttrSIPListen]; !ok {
+				listen, ok := changed[AttrSIPListen]
+				if !ok {
 					return
 				}
-				r.roomLog.Infow("listen list changed", "listen", changed[AttrSIPListen])
+				if r.reconnect.Load() != nil {
+					// A full reconnect rejoins with the first join's attributes; onReconnected
+					// restores the ones we had, so keep the current listen list meanwhile.
+					r.roomLog.Infow("ignoring listen list change while recovering", "listen", listen)
+					return
+				}
+				r.listen.Store(listen)
+				r.roomLog.Infow("listen list changed", "listen", listen)
 				// Subscribing does a blocking websocket write per track; keep it off the SDK's goroutine.
 				go r.applyListen()
 			},
@@ -663,6 +674,7 @@ func (r *Room) newRoomCallback(conf *config.Config, rconf RoomConfig) *lksdk.Roo
 type reconnectState struct {
 	startedAt time.Time
 	sid       string
+	attrs     map[string]string // our attributes before the connection dropped
 }
 
 func recoveryKind(resumed bool) string {
@@ -677,11 +689,15 @@ func recoveryKind(resumed bool) string {
 // detaches our track from its peer connection while the connection is rebuilt,
 // and writes to a detached track are discarded without an error.
 func (r *Room) onReconnecting() {
-	var sid string
+	var (
+		sid   string
+		attrs map[string]string
+	)
 	if room := r.room.Load(); room != nil {
 		sid = room.LocalParticipant.SID()
+		attrs = room.LocalParticipant.Attributes()
 	}
-	r.reconnect.Store(&reconnectState{startedAt: time.Now(), sid: sid})
+	r.reconnect.Store(&reconnectState{startedAt: time.Now(), sid: sid, attrs: attrs})
 	r.stats.Recovering.Store(true)
 	r.roomLog.Infow("lost connection to room, recovering", "participantID", sid)
 }
@@ -734,15 +750,40 @@ func (r *Room) onReconnected() {
 	if resumed {
 		return
 	}
-	if !r.subscribe.Load() {
-		// Call is not answered yet, so subscribing here would pull room audio
-		// into a leg that has not been accepted.
-		return
+	// A reconnect rejoins with the attributes of the first join, losing any set
+	// since (by us or with UpdateParticipant), such as AttrSIPListen.
+	var restore map[string]string
+	if prev != nil {
+		restore = attributesToRestore(prev.attrs, room.LocalParticipant.Attributes())
 	}
+	subscribe := r.subscribe.Load()
+	// Call is not answered yet when !subscribe, so subscribing here would pull
+	// room audio into a leg that has not been accepted.
+	//
 	// The SDK calls this from the reconnect itself, inside the join's timeout,
-	// and subscribing does a blocking websocket write per track. Pass the room we
-	// already read so a concurrent close cannot make this a nil dereference.
-	go r.resubscribeAfterReconnect(room)
+	// and both steps do blocking websocket writes. Pass the room we already read
+	// so a concurrent close cannot make this a nil dereference.
+	go func() {
+		if len(restore) != 0 {
+			r.roomLog.Infow("restoring attributes after reconnect", "attributes", restore)
+			room.LocalParticipant.SetAttributes(restore)
+		}
+		if subscribe {
+			r.resubscribeAfterReconnect(room)
+		}
+	}()
+}
+
+// attributesToRestore returns the updates that bring cur back to prev. Keys
+// missing from prev are left alone.
+func attributesToRestore(prev, cur map[string]string) map[string]string {
+	out := make(map[string]string)
+	for k, v := range prev {
+		if cur[k] != v {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 func (r *Room) resubscribeAfterReconnect(room *lksdk.Room) {

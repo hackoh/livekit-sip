@@ -24,3 +24,11 @@ func TestListenAllows(t *testing.T) {
 		require.Equal(t, c.want, listenAllows(c.listen, c.identity), "listen %q identity %q", c.listen, c.identity)
 	}
 }
+
+func TestAttributesToRestore(t *testing.T) {
+	prev := map[string]string{AttrSIPListen: "customer", "sip.callStatus": "active", "same": "x"}
+	cur := map[string]string{AttrSIPListen: "tsumugi-media", "sip.callStatus": "dialing", "same": "x", "new": "y"}
+	require.Equal(t, map[string]string{AttrSIPListen: "customer", "sip.callStatus": "active"}, attributesToRestore(prev, cur))
+	require.Empty(t, attributesToRestore(nil, cur))
+	require.Equal(t, map[string]string{AttrSIPListen: ""}, attributesToRestore(map[string]string{AttrSIPListen: ""}, cur))
+}
