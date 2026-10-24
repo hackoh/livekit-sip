@@ -365,6 +365,7 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.C
 	s.sipSrv.OnAck(s.wrapHandler(s.onAck))
 	s.sipSrv.OnBye(s.wrapHandler(s.onBye))
 	s.sipSrv.OnNotify(s.wrapHandler(s.onNotify))
+	s.sipSrv.OnUpdate(s.wrapHandler(s.onUpdate))
 	s.sipSrv.OnNoRoute(s.wrapHandler(s.OnNoRoute))
 	s.sipUnhandled = unhandled
 
