@@ -829,7 +829,7 @@ func TestInboundCallStatusCode(t *testing.T) {
 		// The INVITE was never answered, so the call is torn down with a final
 		// response rather than a BYE.
 		res := getFinalResponseOrFail(t, ctx, tx)
-		require.Equal(t, sip.StatusBusyHere, res.StatusCode, "a call whose track could not be published should be rejected")
+		require.Equal(t, sip.StatusServiceUnavailable, res.StatusCode, "a call whose track could not be published should be rejected as unavailable, not busy")
 
 		require.Eventually(t, func() bool {
 			last := states.Last()
@@ -842,6 +842,35 @@ func TestInboundCallStatusCode(t *testing.T) {
 		require.Contains(t, ended.Error, errTestPublishFailed.Error(), "the publish failure must be reported")
 		require.NotNil(t, ended.CallStatusCode, "CallStatusCode must be set")
 		require.EqualValues(t, res.StatusCode, ended.CallStatusCode.Code, "the recorded status must be the one sent to the caller")
+	})
+
+	t.Run("JoinRoomError", func(t *testing.T) {
+		// LiveKit refusing the participant (e.g. "could not find any available nodes") is our failure,
+		// not the callee being busy: 503 lets the proxy in front try another SIP server.
+		initTest(t, newTestRoomConfig(&testRoomConfig{connectErr: errors.New("test: could not find any available nodes")}))
+
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+
+		call := newTestCall(st.TestUA, false)
+		req, localSDP, err := call.Invite(nil)
+		require.NoError(t, err)
+		call.SetLocalSDP(localSDP)
+
+		tx, err := st.TestUA.Client.TransactionRequest(req)
+		require.NoError(t, err)
+		defer tx.Terminate()
+
+		res := getFinalResponseOrFail(t, ctx, tx)
+		require.Equal(t, sip.StatusServiceUnavailable, res.StatusCode)
+
+		require.Eventually(t, func() bool {
+			last := states.Last()
+			return last != nil && last.EndedAtNs != 0
+		}, 5*time.Second, 10*time.Millisecond, "the failed call should be reported")
+		ended := states.Last()
+		require.Equal(t, livekit.SIPCallStatus_SCS_ERROR, ended.CallStatus)
+		require.EqualValues(t, res.StatusCode, ended.CallStatusCode.Code)
 	})
 
 	t.Run("HangupDuringAccept", func(t *testing.T) {
