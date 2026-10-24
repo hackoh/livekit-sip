@@ -1186,7 +1186,7 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 	// Publish our own track.
 	if err := c.publishTrack(disp.EnabledFeatures, disp.FeatureFlags); err != nil {
 		c.log().Errorw("Cannot publish track", err)
-		c.closeWithTerm(ctx, stats.ServerError("publish-failed"))
+		c.closeUnavailable(ctx, stats.ServerError("publish-failed"))
 		return fmt.Errorf("publishing track to room failed: %w", err)
 	}
 	tsub := c.mon.StageDurTimer("track-subscribe")
@@ -1667,6 +1667,17 @@ func (c *inboundCall) closeWithTerm(ctx context.Context, t stats.Termination) {
 	})
 }
 
+// closeUnavailable rejects a call that failed on our side before it was answered (e.g. LiveKit refused
+// the participant). 503 instead of the default 486 lets the upstream proxy try another SIP server,
+// and does not look like the callee being busy.
+func (c *inboundCall) closeUnavailable(ctx context.Context, t stats.Termination) {
+	c.close(ctx, EndCall{
+		Status: callDropped,
+		Term:   t,
+		Code:   sip.StatusServiceUnavailable,
+	})
+}
+
 func (c *inboundCall) EndCall(ctx context.Context, headers map[string]string) error {
 	select {
 	case <-ctx.Done():
@@ -2005,7 +2016,7 @@ func (c *inboundCall) joinRoom(ctx context.Context, rconf RoomConfig, status Cal
 	c.log().Infow("Joining room")
 	if err := c.createLiveKitParticipant(ctx, rconf, status); err != nil {
 		c.log().Errorw("Cannot create LiveKit participant", err)
-		c.closeWithTerm(ctx, stats.ServerError("participant-failed"))
+		c.closeUnavailable(ctx, stats.ServerError("participant-failed"))
 		return fmt.Errorf("cannot create LiveKit participant: %w", err)
 	}
 	c.sigTs.JoinRoomTime = time.Now()

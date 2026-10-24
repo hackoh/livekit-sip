@@ -212,6 +212,9 @@ type testRoomConfig struct {
 	// inboundAudioErr, when set, is returned by GetInboundAudioWriter, standing
 	// in for a failure to publish our own track into the room.
 	inboundAudioErr error
+	// connectErr, when set, is returned by Connect, standing in for LiveKit
+	// refusing the participant (e.g. no available nodes).
+	connectErr error
 }
 
 func newTestRoomConfig(cfg *testRoomConfig) GetRoomFunc {
@@ -287,6 +290,9 @@ func newTestRoomWithConfig(log logger.Logger, st *RoomStats, cfg *testRoomConfig
 
 // Connect overrides Room.Connect to skip actual LiveKit connection
 func (r *testRoom) Connect(_ context.Context, conf *config.Config, rconf RoomConfig) error {
+	if err := r.cfg.connectErr; err != nil {
+		return err
+	}
 	// Update participant info from config
 	partConf := rconf.Participant
 	r.room.p.Store(&ParticipantInfo{
