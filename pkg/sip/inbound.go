@@ -1089,12 +1089,8 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 		c.mon.SDPSize(len(sdpBody), false, false)
 	}
 
-	// With inbound early media, send 183 with our SDP answer and play ringback until the call is accepted.
 	stopEarlyMedia := func() {}
 	defer func() { stopEarlyMedia() }()
-	if !pinPrompt && !expectingLateAnswer {
-		stopEarlyMedia = c.startEarlyMedia(ctx, sdpBody)
-	}
 
 	ok := false
 	if pinPrompt {
@@ -1150,6 +1146,13 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 		c.log().Errorw("Cannot publish track", err)
 		c.closeWithTerm(ctx, stats.ServerError("publish-failed"))
 		return fmt.Errorf("publishing track to room failed: %w", err)
+	}
+
+	// With inbound early media, send 183 with our SDP answer and play ringback until the call is accepted.
+	// Only now that we are in the room: a call that fails before this is rejected without an early dialog,
+	// so a proxy in front can try another SIP server and the caller never sees two different 183s.
+	if !pinPrompt && !expectingLateAnswer {
+		stopEarlyMedia = c.startEarlyMedia(ctx, sdpBody)
 	}
 	tsub := c.mon.StageDurTimer("track-subscribe")
 	c.lkRoom.Subscribe()
