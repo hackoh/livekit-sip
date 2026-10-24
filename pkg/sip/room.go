@@ -46,6 +46,12 @@ import (
 // call has been torn down.
 var errRoomClosed = errors.New("room is closed")
 
+// AttrSIPListen is a SIP participant attribute that limits which participants it
+// hears: a comma-separated list of identities. A missing or empty value means
+// every participant, as before. It can be set when the participant is created or
+// changed later with UpdateParticipant.
+const AttrSIPListen = "lk.sip.listen"
+
 type RoomStatsSnapshot struct {
 	// Stats quantifying total incoming traffic from all tracks
 	InputPackets   uint64 `json:"input_packets"`
@@ -244,6 +250,7 @@ type Room struct {
 	stopped    core.Fuse
 	closed     core.Fuse
 	stats      *RoomStats
+	listenMu   sync.Mutex // serializes applyListen
 }
 
 type ParticipantConfig struct {
@@ -357,10 +364,64 @@ func (r *Room) participantLeft(rp *lksdk.RemoteParticipant) {
 	log.Debugw("participant left")
 }
 
+// listenAllowed reports whether this SIP participant may hear rp, according to
+// its own AttrSIPListen attribute. A missing or empty attribute allows everyone.
+func (r *Room) listenAllowed(rp *lksdk.RemoteParticipant) bool {
+	room := r.room.Load()
+	if room == nil {
+		return true
+	}
+	return listenAllows(room.LocalParticipant.Attributes()[AttrSIPListen], rp.Identity())
+}
+
+func listenAllows(listen, identity string) bool {
+	if strings.TrimSpace(listen) == "" {
+		return true
+	}
+	for _, id := range strings.Split(listen, ",") {
+		if id = strings.TrimSpace(id); id != "" && id == identity {
+			return true
+		}
+	}
+	return false
+}
+
+// applyListen re-applies AttrSIPListen to every remote audio track after it
+// changes: allowed tracks are subscribed, the others unsubscribed.
+func (r *Room) applyListen() {
+	r.listenMu.Lock()
+	defer r.listenMu.Unlock()
+	room := r.room.Load()
+	if room == nil || !r.subscribe.Load() {
+		// Not answered yet: Subscribe applies the attribute when the call is accepted.
+		return
+	}
+	for _, rp := range room.GetRemoteParticipants() {
+		for _, pub := range rp.TrackPublications() {
+			remotePub, ok := pub.(*lksdk.RemoteTrackPublication)
+			if !ok || remotePub.Kind() != lksdk.TrackKindAudio {
+				continue
+			}
+			if r.listenAllowed(rp) {
+				r.subscribeTo(remotePub, rp)
+				continue
+			}
+			r.roomLog.Debugw("unsubscribing from a track not in listen list", "participant", rp.Identity(), "trackID", remotePub.SID())
+			if err := remotePub.SetSubscribed(false); err != nil {
+				r.roomLog.Errorw("cannot unsubscribe from the track", err, "participant", rp.Identity(), "trackID", remotePub.SID())
+			}
+		}
+	}
+}
+
 func (r *Room) subscribeTo(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 	log := r.roomLog.WithValues("participant", rp.Identity(), "participantID", rp.SID(), "trackID", pub.SID(), "trackName", pub.Name())
 	if pub.Kind() != lksdk.TrackKindAudio {
 		log.Debugw("skipping non-audio track")
+		return
+	}
+	if !r.listenAllowed(rp) {
+		log.Debugw("skipping track not in listen list")
 		return
 	}
 	log.Debugw("subscribing to a track")
@@ -472,6 +533,17 @@ func (r *Room) newRoomCallback(conf *config.Config, rconf RoomConfig) *lksdk.Roo
 			r.participantLeft(rp)
 		},
 		ParticipantCallback: lksdk.ParticipantCallback{
+			OnAttributesChanged: func(changed map[string]string, p lksdk.Participant) {
+				if _, ok := p.(*lksdk.LocalParticipant); !ok {
+					return
+				}
+				if _, ok := changed[AttrSIPListen]; !ok {
+					return
+				}
+				r.roomLog.Infow("listen list changed", "listen", changed[AttrSIPListen])
+				// Subscribing does a blocking websocket write per track; keep it off the SDK's goroutine.
+				go r.applyListen()
+			},
 			OnTrackPublished: func(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
 				log := r.roomLog.WithValues("participant", rp.Identity(), "participantID", rp.SID(), "trackID", pub.SID(), "trackName", pub.Name())
 				if !r.subscribe.Load() {
