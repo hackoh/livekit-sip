@@ -752,6 +752,44 @@ func (s *Server) onBye(log *slog.Logger, req *sip.Request, tx sip.ServerTransact
 	}
 }
 
+// onUpdate answers an in-dialog UPDATE (RFC 3311). Carriers send one without SDP while ringing
+// or as a session refresh; answering 405 to it risks the call being torn down.
+func (s *Server) onUpdate(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+	tag, err := GetLocalTagUAS(req)
+	if err != nil {
+		_ = tx.Respond(newResponse(req, sip.StatusBadRequest, "", nil))
+		return
+	}
+
+	s.cmu.RLock()
+	c := s.byLocalTag[tag]
+	s.cmu.RUnlock()
+	if c != nil {
+		c.log().Infow("UPDATE", "sdp", len(req.Body()) != 0)
+		_ = tx.Respond(updateResponse(req, c.cc.contact))
+		return
+	}
+	ok := false
+	if s.sipUnhandled != nil {
+		ok = s.sipUnhandled(req, tx)
+	}
+	if !ok {
+		s.log.Infow("UPDATE for non-existent call")
+		_ = tx.Respond(newResponse(req, sip.StatusCallTransactionDoesNotExists, "", nil))
+	}
+}
+
+// updateResponse accepts an UPDATE without SDP. An offer in an UPDATE is refused with 488: media
+// is never renegotiated mid-call, and the session stays as it is.
+func updateResponse(req *sip.Request, contact *sip.ContactHeader) *sip.Response {
+	if len(req.Body()) != 0 {
+		return newResponse(req, sip.StatusNotAcceptableHere, "", nil)
+	}
+	r := newResponse(req, sip.StatusOK, "", nil)
+	r.AppendHeader(contact)
+	return r
+}
+
 func (s *Server) OnNoRoute(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
 	callID := ""
 	if h := req.CallID(); h != nil {
